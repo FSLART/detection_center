@@ -11,6 +11,8 @@
 #include "rclcpp_components/register_node_macro.hpp"
 #include <lart_msgs/msg/state.hpp>
 #include <lart_msgs/srv/heartbeat.hpp>
+#include <lart_msgs/msg/cone_array.hpp>
+#include <lart_msgs/msg/cone.hpp>
 #include <foxglove_msgs/msg/image_annotations.hpp>
 #include "detection_center/detection_center.hpp"
 

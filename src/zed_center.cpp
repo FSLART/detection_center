@@ -136,7 +136,21 @@ void ZedCenter::publishImages()
         left_camera_info_template.header.stamp = timestamp;
         this->left_image_pub.publish(left_image_msg);
         this->left_info_pub->publish(left_camera_info_template);
-        detector_.detect(left_image_cv_rgb);
+
+        // Retrieve depth map
+        sl::Mat depth_map;
+        zed.retrieveMeasure(depth_map, sl::MEASURE::DEPTH);
+        cv::Mat depth_cv = cv::Mat(depth_map.getHeight(), depth_map.getWidth(), 
+                                   CV_32FC1, depth_map.getPtr<sl::uchar1>(MEM::CPU),
+                                   depth_map.getStepBytes(MEM::CPU));
+        // Build intrinsics from cached calibration
+        CameraIntrinsics intrinsics;
+        intrinsics.fx = cached_calibration_params.left_cam.fx;
+        intrinsics.fy = cached_calibration_params.left_cam.fy;
+        intrinsics.cx = cached_calibration_params.left_cam.cx;
+        intrinsics.cy = cached_calibration_params.left_cam.cy;
+
+        detector_.detect(left_image_cv_rgb, depth_cv, intrinsics);
     }
     else
     {

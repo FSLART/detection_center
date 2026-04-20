@@ -73,6 +73,10 @@ DetectionCenter::DetectionCenter(const std::string& enginePath) {
     inputName_  = engine_->getIOTensorName(0);
     outputName_ = engine_->getIOTensorName(1);
 
+    Dims outDims = engine_->getTensorShape(outputName_); // [batch_size, num_fields, num_anchors]
+    numFields_  = outDims.d[1]; // 9 (4 coords + 5 classes)
+    numAnchors_ = outDims.d[2];
+
     // Allocate buffers based on engine shape
     // d_input and d_output are the memory of the device, aka the GPU, hence why we need to use cudaMalloc
     // h_input and h_output are the memory of the host, aka the system's RAM
@@ -106,8 +110,8 @@ DetectionCenter::DetectionCenter(const std::string& enginePath) {
     // bindings_[0] = d_input_;
     // bindings_[1] = d_output_;
     // New TensorRT (10+) name-based approach:
-    context_->setTensorAddress(inputName_,  d_input_);
-    context_->setTensorAddress(outputName_, d_output_);
+    context_->setTensorAddress(inputName_.c_str(),  d_input_);
+    context_->setTensorAddress(outputName_.c_str(), d_output_);
 
     // Cache input dimensions for preprocessing
     // Old TensorRT (<=8.x):
@@ -127,16 +131,23 @@ DetectionCenter::~DetectionCenter() {
     delete runtime_;
 }
 
-void DetectionCenter::detect(const cv::Mat& frame) {
+void DetectionCenter::detect(const cv::Mat& frame, const cv::Mat& depth, const CameraIntrinsics& intrinsics) {
+    // clear detection results from previous frames
+    boxes_.clear();
+    scores_.clear();
+    classIds_.clear();
+
+    static lart_msgs::msg::ConeArray cone_array;
+
     // 1. Preprocess: resize and normalize
-    cv::resize(frame, resized, cv::Size(inputWidth_, inputHeight_));
-    resized.convertTo(resized, CV_16F, 1.0 / 255.0);
+    cv::resize(frame, resized_, cv::Size(inputWidth_, inputHeight_));
+    resized_.convertTo(resized_, CV_16F, 1.0 / 255.0);
 
     // 2. Convert HWC → CHW
-    cv::split(resized, channels);
+    cv::split(resized_, channels_);
     int channelSize = inputHeight_ * inputWidth_;
     for (int c = 0; c < 3; c++)
-        memcpy(h_input_.data() + c * channelSize, channels[c].data, channelSize * sizeof(uint16_t));
+        memcpy(h_input_.data() + c * channelSize, channels_[c].data, channelSize * sizeof(uint16_t));
 
     // 3. Run inference
     cudaMemcpyAsync(d_input_, h_input_.data(), inputSize_, cudaMemcpyHostToDevice, stream_);
@@ -152,5 +163,58 @@ void DetectionCenter::detect(const cv::Mat& frame) {
     cv::Mat output_fp32;
     output_fp16.convertTo(output_fp32, CV_32F);
 
-    // Process output_fp32 here (decode boxes, NMS, publish results...)
+    // ------------------------ Process output_fp32 here (decode boxes, NMS, publish results...) ------------------------
+
+    // Reshape and transpose as before
+    cv::Mat reshaped(numFields_, numAnchors_, CV_32F, output_fp32.data);
+    cv::Mat table;
+    cv::transpose(reshaped, table);
+
+    // Extract all class scores at once (columns 4-8) and find max per row
+    cv::Mat classScores = table.colRange(4, numFields_);
+    cv::Mat maxScores;
+    cv::reduce(classScores, maxScores,  1, cv::REDUCE_MAX);  // max score per row
+
+    // Filter rows by confidence threshold in one shot
+    cv::Mat mask = maxScores > 0.5f;
+
+    // Process surviving rows
+    for (int i = 0; i < numAnchors_; i++) {
+        if (!mask.at<uint8_t>(i)) continue; // skip in one check
+
+        float* row = table.ptr<float>(i);
+
+        // classId — find index of max score
+        int classId = std::max_element(row + 4, row + numFields_) - (row + 4);
+
+        float x1 = (row[0] - row[2] / 2) * frame.cols;
+        float y1 = (row[1] - row[3] / 2) * frame.rows;
+        float w  = row[2] * frame.cols;
+        float h  = row[3] * frame.rows;
+
+        boxes_.emplace_back(x1, y1, w, h);
+        scores_.emplace_back(maxScores.at<float>(i));
+        classIds_.emplace_back(classId);
+    }
+
+    // NMS
+    std::vector<int> indices;
+    cv::dnn::NMSBoxes(boxes_, scores_, 0.5f, 0.45f, indices);
+
+    for (int idx : indices) {
+        cv::Rect box = boxes_[idx];
+        float score  = scores_[idx];
+        int classId  = classIds_[idx];
+
+        // create cone message
+        lart_msgs::msg::Cone cone;
+        cone.header.frame_id = "base_footprint";
+        cone.position.x = box.x;
+        cone.position.y = box.y;
+        cone.position.z = 0.0;
+        cone.class_type.data = obj.raw_label;
+
+        cone_array.cones.push_back(std::move(cone));
+    }
+    cone_array_pub->publish(std::move(cone_array));
 }
