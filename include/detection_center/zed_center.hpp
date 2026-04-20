@@ -8,11 +8,14 @@
 #include <opencv2/opencv.hpp>
 #include <image_transport/image_transport.hpp>
 #include <cmath>
+#include <algorithm>
 #include "rclcpp_components/register_node_macro.hpp"
 #include <lart_msgs/msg/state.hpp>
 #include <lart_msgs/srv/heartbeat.hpp>
 #include <lart_msgs/msg/cone_array.hpp>
 #include <lart_msgs/msg/cone.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 #include <foxglove_msgs/msg/image_annotations.hpp>
 #include "detection_center/detection_center.hpp"
 
@@ -65,10 +68,18 @@ private:
 
     rclcpp::Time last_capture_time;
     rclcpp::Service<lart_msgs::srv::Heartbeat>::SharedPtr timestamp_service_;
-
+    rclcpp::Publisher<lart_msgs::msg::ConeArray>::SharedPtr cone_array_pub;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_array_pub;
     rclcpp::Publisher<foxglove_msgs::msg::ImageAnnotations>::SharedPtr annotations_pub_;
     
+    // Camera → base_footprint transform matrix (same as zed_bridge, using double)
+    double transform_matrix_[4][4];
+
+    // Marker IDs from previous frame (used to delete old markers)
+    std::vector<int> marker_ids_;
+
     void publishImages();
+    void handle_timestamp_request(const std::shared_ptr<lart_msgs::srv::Heartbeat::Request> request, std::shared_ptr<lart_msgs::srv::Heartbeat::Response> response);
 
     static int getOCVtype(sl::MAT_TYPE type);
     static cv::Mat slMat2cvMat(sl::Mat &input);

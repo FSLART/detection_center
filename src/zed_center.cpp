@@ -48,7 +48,6 @@ ZedCenter::ZedCenter(const rclcpp::NodeOptions& options, DetectionCenter& detect
     PositionalTrackingParameters tracking_params;
     this->zed.enablePositionalTracking(tracking_params);
 
-
     this->frame_counter = 0;
 
     this->left_image_pub = image_transport::create_publisher(this, "/zed/left/image_raw");
@@ -56,6 +55,10 @@ ZedCenter::ZedCenter(const rclcpp::NodeOptions& options, DetectionCenter& detect
 
     this->left_info_pub = this->create_publisher<sensor_msgs::msg::CameraInfo>("/zed/left/camera_info", 10);
     this->depth_info_pub = this->create_publisher<sensor_msgs::msg::CameraInfo>("/zed/depth/camera_info", 10);
+
+    this->cone_array_pub = this->create_publisher<lart_msgs::msg::ConeArray>("/mapping/cones", 10);
+    this->marker_array_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("/mapping/cones_markers", 10);
+    this->annotations_pub_ = this->create_publisher<foxglove_msgs::msg::ImageAnnotations>("/zed/image_annotations", 10);
     
     // Cache camera info once instead of getting it every frame
     this->cached_camera_info = zed.getCameraInformation();
@@ -64,6 +67,15 @@ ZedCenter::ZedCenter(const rclcpp::NodeOptions& options, DetectionCenter& detect
     // Pre-populate camera info message templates
     setupCameraInfoTemplates();
     this->last_image_time = std::chrono::steady_clock::now();
+
+    // base_footprint transform matrix
+    transform_matrix_[0][0] = 1.0; transform_matrix_[0][1] = 0.0; transform_matrix_[0][2] = 0.0; transform_matrix_[0][3] = -0.5;
+    transform_matrix_[1][0] = 0.0; transform_matrix_[1][1] = 1.0; transform_matrix_[1][2] = 0.0; transform_matrix_[1][3] = 0.0;
+    transform_matrix_[2][0] = 0.0; transform_matrix_[2][1] = 0.0; transform_matrix_[2][2] = 1.0; transform_matrix_[2][3] = 0.95;
+    transform_matrix_[3][0] = 0.0; transform_matrix_[3][1] = 0.0; transform_matrix_[3][2] = 0.0; transform_matrix_[3][3] = 1.0;
+
+    // Create heartbeat service
+    this->timestamp_service_ = this->create_service<lart_msgs::srv::Heartbeat>("zed/last_timestamp", std::bind(&ZedCenter::handle_timestamp_request, this, std::placeholders::_1, std::placeholders::_2));
 
     timer_ = this->create_wall_timer(
         std::chrono::milliseconds(30), 
@@ -113,11 +125,27 @@ void ZedCenter::publishImages()
         sl::Mat left_image;
         zed.retrieveImage(left_image, VIEW::LEFT);
 
+        // Retrieve depth map (needed for 2D to 3D back-projection)
+        sl::Mat depth_map;
+        zed.retrieveMeasure(depth_map, sl::MEASURE::DEPTH);
+        cv::Mat depth_cv = cv::Mat(depth_map.getHeight(), depth_map.getWidth(),
+                                   CV_32FC1, depth_map.getPtr<sl::uchar1>(MEM::CPU),
+                                   depth_map.getStepBytes(MEM::CPU));
+
         // Pre-allocate reusable objects as static to avoid repeated allocations
         static cv::Mat left_image_cv_bgra;
         static cv::Mat left_image_cv_rgb;
         static sensor_msgs::msg::Image left_image_msg;
         static sensor_msgs::msg::Image depth_image_msg;
+        static lart_msgs::msg::ConeArray cone_array;
+        static visualization_msgs::msg::MarkerArray marker_array;
+        static foxglove_msgs::msg::ImageAnnotations annotations_msg;
+
+        // Clear containers instead of recreating
+        cone_array.cones.clear();
+        marker_array.markers.clear();
+        annotations_msg.points.clear();
+        annotations_msg.texts.clear();
 
         // convert the image to OpenCV format
         left_image_cv_bgra = slMat2cvMat(left_image);
@@ -137,20 +165,194 @@ void ZedCenter::publishImages()
         this->left_image_pub.publish(left_image_msg);
         this->left_info_pub->publish(left_camera_info_template);
 
-        // Retrieve depth map
-        sl::Mat depth_map;
-        zed.retrieveMeasure(depth_map, sl::MEASURE::DEPTH);
-        cv::Mat depth_cv = cv::Mat(depth_map.getHeight(), depth_map.getWidth(), 
-                                   CV_32FC1, depth_map.getPtr<sl::uchar1>(MEM::CPU),
-                                   depth_map.getStepBytes(MEM::CPU));
-        // Build intrinsics from cached calibration
-        CameraIntrinsics intrinsics;
-        intrinsics.fx = cached_calibration_params.left_cam.fx;
-        intrinsics.fy = cached_calibration_params.left_cam.fy;
-        intrinsics.cx = cached_calibration_params.left_cam.cx;
-        intrinsics.cy = cached_calibration_params.left_cam.cy;
+        // --- Run YOLO inference (returns raw 2D detections) ---
+        auto detections = detector_.detect(left_image_cv_rgb);
 
-        detector_.detect(left_image_cv_rgb, depth_cv, intrinsics);
+        // Cache camera intrinsics for back-projection
+        const double fx = cached_calibration_params.left_cam.fx;
+        const double fy = cached_calibration_params.left_cam.fy;
+        const double cx = cached_calibration_params.left_cam.cx;
+        const double cy = cached_calibration_params.left_cam.cy;
+
+        // Reserve space for detections
+        cone_array.cones.reserve(detections.size());
+        marker_array.markers.reserve(detections.size() + this->marker_ids_.size());
+
+        // Delete old markers from previous frame
+        for (const auto &marker_id : this->marker_ids_)
+        {
+            visualization_msgs::msg::Marker old_marker;
+            old_marker.header.frame_id = "base_footprint";
+            old_marker.header.stamp = timestamp;
+            old_marker.ns = "cone_marker";
+            old_marker.id = marker_id;
+            old_marker.action = visualization_msgs::msg::Marker::DELETE;
+            marker_array.markers.push_back(std::move(old_marker));
+        }
+        this->marker_ids_.clear();
+
+        // --- Process each detection ---
+        for (size_t i = 0; i < detections.size(); ++i)
+        {
+            const auto &det = detections[i];
+            const cv::Rect &box = det.box;
+
+            // STEP 1: Find the center pixel of the bounding box
+            double cx_px = box.x + box.width  / 2.0;
+            double cy_px = box.y + box.height / 2.0;
+
+            // STEP 2: Sample depth at the center pixel (clamp to image bounds)
+            int u = std::clamp(static_cast<int>(cx_px), 0, depth_cv.cols - 1);
+            int v = std::clamp(static_cast<int>(cy_px), 0, depth_cv.rows - 1);
+            float Z = depth_cv.at<float>(v, u);  // depth map is CV_32FC1, value in meters
+
+            // Skip invalid depth readings
+            if (std::isnan(Z) || std::isinf(Z) || Z <= 0.0f)
+            {
+                continue;
+            }
+
+            // STEP 3: Back-project to 3D camera frame (X=right, Y=down, Z=forward)
+            double X_cam = (cx_px - cx) * Z / fx;
+            double Y_cam = (cy_px - cy) * Z / fy;
+            double Z_cam = Z;
+
+            // STEP 4: Convert camera frame → ZED coordinate system (RIGHT_HANDED_Z_UP_X_FWD)
+            //    Camera: X=right, Y=down, Z=forward
+            //    ZED:    X=forward, Y=left, Z=up
+            double obj_x =  Z_cam;   // forward
+            double obj_y = -X_cam;   // left
+            double obj_z = -Y_cam;   // up
+
+            // STEP 5: Distance filter (squared to avoid sqrt, same as zed_bridge.cpp)
+            double distance_sq = obj_x * obj_x + obj_y * obj_y;
+            if (distance_sq < 0.25 || distance_sq > 650.0)  // 0.5m² to ~25.5m²
+            {
+                continue;
+            }
+
+            // STEP 6: Apply transform matrix (camera → base_footprint)
+            double transformed_x = transform_matrix_[0][0] * obj_x + transform_matrix_[0][1] * obj_y +
+                                    transform_matrix_[0][2] * obj_z + transform_matrix_[0][3];
+            double transformed_y = transform_matrix_[1][0] * obj_x + transform_matrix_[1][1] * obj_y +
+                                    transform_matrix_[1][2] * obj_z + transform_matrix_[1][3];
+            double transformed_z = transform_matrix_[2][0] * obj_x + transform_matrix_[2][1] * obj_y +
+                                    transform_matrix_[2][2] * obj_z + transform_matrix_[2][3];
+
+            // --- Create Cone message ---
+            lart_msgs::msg::Cone cone;
+            cone.header.frame_id = "base_footprint";
+            cone.position.x = transformed_x;
+            cone.position.y = transformed_y;
+            cone.position.z = 0.0;
+            cone.bbox_width = box.width;
+            cone.bbox_height = box.height;
+            cone.class_type.data = det.classId;
+
+            cone_array.cones.push_back(std::move(cone));
+
+            // --- Create Marker ---
+            visualization_msgs::msg::Marker marker;
+            marker.header.frame_id = "base_footprint";
+            marker.header.stamp = timestamp;
+            marker.ns = "cone_marker";
+            marker.id = this->frame_counter * 1000 + i;
+            this->marker_ids_.push_back(marker.id);
+
+            marker.type = visualization_msgs::msg::Marker::CYLINDER;
+            marker.action = visualization_msgs::msg::Marker::ADD;
+            marker.lifetime = rclcpp::Duration::from_seconds(0.2);
+
+            marker.pose.position.x = transformed_x;
+            marker.pose.position.y = transformed_y;
+            marker.pose.position.z = 0.0;
+            marker.pose.orientation.w = 1.0;
+            marker.scale.x = 0.23;
+            marker.scale.y = 0.23;
+            marker.scale.z = 0.31;
+
+            // --- Prepare Foxglove 2D annotation ---
+            foxglove_msgs::msg::PointsAnnotation poly;
+            poly.type = foxglove_msgs::msg::PointsAnnotation::LINE_LOOP;
+            poly.thickness = 3.0;
+
+            // Color marker and annotation based on class (same as zed_bridge.cpp)
+            switch (det.classId)
+            {
+            case 1: // Yellow
+                marker.color.r = 1.0; marker.color.g = 1.0; marker.color.b = 0.0; marker.color.a = 1.0;
+                poly.outline_color.r = 1.0; poly.outline_color.g = 1.0; poly.outline_color.b = 0.0; poly.outline_color.a = 1.0;
+                break;
+            case 2: // Blue
+                marker.color.r = 0.0; marker.color.g = 0.0; marker.color.b = 1.0; marker.color.a = 1.0;
+                poly.outline_color.r = 0.0; poly.outline_color.g = 0.0; poly.outline_color.b = 1.0; poly.outline_color.a = 1.0;
+                break;
+            case 3: // Lil Orange
+                marker.color.r = 1.0; marker.color.g = 0.5; marker.color.b = 0.0; marker.color.a = 1.0;
+                poly.outline_color.r = 1.0; poly.outline_color.g = 0.5; poly.outline_color.b = 0.0; poly.outline_color.a = 1.0;
+                break;
+            case 4: // Big Orange
+                marker.color.r = 1.0; marker.color.g = 0.5; marker.color.b = 0.0; marker.color.a = 1.0;
+                marker.scale.x = 0.35; marker.scale.y = 0.35; marker.scale.z = 0.50;
+                poly.outline_color.r = 1.0; poly.outline_color.g = 0.5; poly.outline_color.b = 0.0; poly.outline_color.a = 1.0;
+                break;
+            default: // Default (Yellow)
+                marker.color.r = 1.0; marker.color.g = 1.0; marker.color.b = 0.0; marker.color.a = 1.0;
+                poly.outline_color.r = 1.0; poly.outline_color.g = 1.0; poly.outline_color.b = 0.0; poly.outline_color.a = 1.0;
+            }
+
+            marker_array.markers.push_back(std::move(marker));
+
+            // Build the 2D bounding box polygon from the 4 corners of the cv::Rect
+            foxglove_msgs::msg::Point2 p1, p2, p3, p4;
+            p1.x = box.x;               p1.y = box.y;                // Top-Left
+            p2.x = box.x + box.width;   p2.y = box.y;                // Top-Right
+            p3.x = box.x + box.width;   p3.y = box.y + box.height;   // Bottom-Right
+            p4.x = box.x;               p4.y = box.y + box.height;   // Bottom-Left
+
+            poly.points.push_back(p1);
+            poly.points.push_back(p2);
+            poly.points.push_back(p3);
+            poly.points.push_back(p4);
+            annotations_msg.points.push_back(std::move(poly));
+
+            // Add confidence text above the bounding box
+            foxglove_msgs::msg::TextAnnotation txt;
+            txt.position.x = box.x;
+            txt.position.y = box.y - 15;  // Slightly above the top-left corner
+            txt.text = std::to_string(static_cast<int>(det.score * 100)) + "%";
+            txt.font_size = 20.0;
+            txt.text_color.r = 1.0; txt.text_color.g = 1.0; txt.text_color.b = 1.0; txt.text_color.a = 1.0;
+            annotations_msg.texts.push_back(std::move(txt));
+        }
+
+        // Publish cone array, markers, and annotations
+        this->cone_array_pub->publish(std::move(cone_array));
+        this->marker_array_pub->publish(std::move(marker_array));
+        this->annotations_pub_->publish(annotations_msg);
+
+        // Publish depth image (same pattern as zed_bridge.cpp lines 404-432)
+        depth_image_msg.header.stamp = timestamp;
+        depth_image_msg.header.frame_id = LEFT_IMG_FRAME_ID;
+        depth_image_msg.height = depth_map.getHeight();
+        depth_image_msg.width = depth_map.getWidth();
+        depth_image_msg.encoding = "32FC1";
+        depth_image_msg.step = depth_map.getStepBytes();
+        const size_t data_size = depth_map.getHeight() * depth_map.getWidth() * sizeof(float);
+        const uint8_t *data_ptr = reinterpret_cast<const uint8_t *>(depth_map.getPtr<sl::float1>());
+        depth_image_msg.data.assign(data_ptr, data_ptr + data_size);
+
+        depth_camera_info_template.header.stamp = timestamp;
+        depth_camera_info_template.height = depth_image_msg.height;
+        depth_camera_info_template.width = depth_image_msg.width;
+        depth_camera_info_template.header.frame_id = LEFT_IMG_FRAME_ID;
+
+        // Publish using image_transport (same as zed_bridge.cpp line 432)
+        this->depth_image_pub.publish(std::make_shared<sensor_msgs::msg::Image>(std::move(depth_image_msg)));
+        this->depth_info_pub->publish(depth_camera_info_template);
+
+        this->frame_counter++;
+        this->first_image = true;
     }
     else
     {
@@ -192,4 +394,13 @@ cv::Mat ZedCenter::slMat2cvMat(sl::Mat &input)
     // Since cv::Mat data requires a uchar* pointer, we get the uchar1 pointer from sl::Mat (getPtr<T>())
     // cv::Mat and sl::Mat will share a single memory structure
     return cv::Mat(input.getHeight(), input.getWidth(), getOCVtype(input.getDataType()), input.getPtr<sl::uchar1>(MEM::CPU), input.getStepBytes(sl::MEM::CPU));
+}
+
+void ZedCenter::handle_timestamp_request(
+    const std::shared_ptr<lart_msgs::srv::Heartbeat::Request> request,
+    std::shared_ptr<lart_msgs::srv::Heartbeat::Response> response)
+{
+    (void)request;
+
+    response->timestamp = this->last_capture_time;
 }

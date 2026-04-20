@@ -4,18 +4,21 @@
 #include <cuda_runtime_api.h>
 #include <vector>
 #include <cstdint>
-#include <lart_msgs/msg/cone.hpp>
-#include <lart_msgs/msg/cone_array.hpp>
-#include <lart_msgs/msg/state.hpp>
 
 class DetectionCenter {
 public:
+    // Raw 2D detection result from YOLO inference
+    struct Detection {
+        cv::Rect box;      // bounding box in pixel coordinates
+        float score;        // confidence score
+        int classId;        // class index
+    };
+
     DetectionCenter(const std::string& enginePath);
     ~DetectionCenter();
-    struct CameraIntrinsics {
-        float fx, fy, cx, cy;
-    };
-    void detect(const cv::Mat& frame, const cv::Mat& depth, const CameraIntrinsics& intrinsics);
+
+    std::vector<Detection> detect(const cv::Mat& frame);
+
 private:
     nvinfer1::IRuntime* runtime_;
     nvinfer1::ICudaEngine* engine_;

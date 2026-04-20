@@ -131,13 +131,11 @@ DetectionCenter::~DetectionCenter() {
     delete runtime_;
 }
 
-void DetectionCenter::detect(const cv::Mat& frame, const cv::Mat& depth, const CameraIntrinsics& intrinsics) {
+std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& frame) {
     // clear detection results from previous frames
     boxes_.clear();
     scores_.clear();
     classIds_.clear();
-
-    static lart_msgs::msg::ConeArray cone_array;
 
     // 1. Preprocess: resize and normalize
     cv::resize(frame, resized_, cv::Size(inputWidth_, inputHeight_));
@@ -163,7 +161,7 @@ void DetectionCenter::detect(const cv::Mat& frame, const cv::Mat& depth, const C
     cv::Mat output_fp32;
     output_fp16.convertTo(output_fp32, CV_32F);
 
-    // ------------------------ Process output_fp32 here (decode boxes, NMS, publish results...) ------------------------
+    // ------------------------ Decode boxes, NMS ------------------------
 
     // Reshape and transpose as before
     cv::Mat reshaped(numFields_, numAnchors_, CV_32F, output_fp32.data);
@@ -187,10 +185,10 @@ void DetectionCenter::detect(const cv::Mat& frame, const cv::Mat& depth, const C
         // classId — find index of max score
         int classId = std::max_element(row + 4, row + numFields_) - (row + 4);
 
-        float x1 = (row[0] - row[2] / 2) * frame.cols;
-        float y1 = (row[1] - row[3] / 2) * frame.rows;
         float w  = row[2] * frame.cols;
         float h  = row[3] * frame.rows;
+        float x1 = row[0] * frame.cols - w / 2.0f;  // top-left x
+        float y1 = row[1] * frame.rows - h / 2.0f;  // top-left y
 
         boxes_.emplace_back(x1, y1, w, h);
         scores_.emplace_back(maxScores.at<float>(i));
@@ -201,20 +199,17 @@ void DetectionCenter::detect(const cv::Mat& frame, const cv::Mat& depth, const C
     std::vector<int> indices;
     cv::dnn::NMSBoxes(boxes_, scores_, 0.5f, 0.45f, indices);
 
+    // Build result vector with only NMS survivors
+    std::vector<Detection> detections;
+    detections.reserve(indices.size());
+
     for (int idx : indices) {
-        cv::Rect box = boxes_[idx];
-        float score  = scores_[idx];
-        int classId  = classIds_[idx];
-
-        // create cone message
-        lart_msgs::msg::Cone cone;
-        cone.header.frame_id = "base_footprint";
-        cone.position.x = box.x;
-        cone.position.y = box.y;
-        cone.position.z = 0.0;
-        cone.class_type.data = obj.raw_label;
-
-        cone_array.cones.push_back(std::move(cone));
+        Detection det;
+        det.box = boxes_[idx];
+        det.score = scores_[idx];
+        det.classId = classIds_[idx];
+        detections.push_back(det);
     }
-    cone_array_pub->publish(std::move(cone_array));
+
+    return detections;
 }

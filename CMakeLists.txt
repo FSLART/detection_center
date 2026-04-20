@@ -21,6 +21,9 @@ find_package(CUDA ${ZED_CUDA_VERSION} REQUIRED)
 # Find foxglove_msgs
 find_package(foxglove_msgs REQUIRED)
 
+# Find visualization_msgs
+find_package(visualization_msgs REQUIRED)
+
 # TensorRT paths — may need some adjustment
 set(TENSORRT_ROOT /usr/local/tensorrt)
 set(TENSORRT_INCLUDE_DIRS ${TENSORRT_ROOT}/include)
@@ -64,6 +67,7 @@ ament_target_dependencies(detection_center
     image_transport
     cv_bridge
     foxglove_msgs
+    visualization_msgs
 )
 
 # Install the executable so ros2 run can find it
