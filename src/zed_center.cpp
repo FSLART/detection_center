@@ -236,8 +236,6 @@ void ZedCenter::publishImages()
                                     transform_matrix_[0][2] * obj_z + transform_matrix_[0][3];
             double transformed_y = transform_matrix_[1][0] * obj_x + transform_matrix_[1][1] * obj_y +
                                     transform_matrix_[1][2] * obj_z + transform_matrix_[1][3];
-            double transformed_z = transform_matrix_[2][0] * obj_x + transform_matrix_[2][1] * obj_y +
-                                    transform_matrix_[2][2] * obj_z + transform_matrix_[2][3];
 
             // --- Create Cone message ---
             lart_msgs::msg::Cone cone;
@@ -245,8 +243,6 @@ void ZedCenter::publishImages()
             cone.position.x = transformed_x;
             cone.position.y = transformed_y;
             cone.position.z = 0.0;
-            cone.bbox_width = box.width;
-            cone.bbox_height = box.height;
             cone.class_type.data = det.classId;
 
             cone_array.cones.push_back(std::move(cone));

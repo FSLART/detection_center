@@ -73,7 +73,7 @@ DetectionCenter::DetectionCenter(const std::string& enginePath) {
     inputName_  = engine_->getIOTensorName(0);
     outputName_ = engine_->getIOTensorName(1);
 
-    Dims outDims = engine_->getTensorShape(outputName_); // [batch_size, num_fields, num_anchors]
+    Dims outDims = engine_->getTensorShape(outputName_.c_str()); // [batch_size, num_fields, num_anchors]
     numFields_  = outDims.d[1]; // 9 (4 coords + 5 classes)
     numAnchors_ = outDims.d[2];
 
@@ -84,8 +84,8 @@ DetectionCenter::DetectionCenter(const std::string& enginePath) {
     // inputSize_  = getBindingSize(engine_, 0) * sizeof(uint16_t);
     // outputSize_ = getBindingSize(engine_, 1) * sizeof(uint16_t);
     // New TensorRT (10+):
-    inputSize_  = getTensorBindingSize(engine_, inputName_)  * sizeof(uint16_t);
-    outputSize_ = getTensorBindingSize(engine_, outputName_) * sizeof(uint16_t);
+    inputSize_  = getTensorBindingSize(engine_, inputName_.c_str())  * sizeof(uint16_t);
+    outputSize_ = getTensorBindingSize(engine_, outputName_.c_str()) * sizeof(uint16_t);
 
     cudaError_t err;
     err = cudaMalloc(&d_input_, inputSize_);
@@ -117,7 +117,7 @@ DetectionCenter::DetectionCenter(const std::string& enginePath) {
     // Old TensorRT (<=8.x):
     // Dims dims   = engine_->getBindingDimensions(0);
     // New TensorRT (10+):
-    Dims dims   = engine_->getTensorShape(inputName_);
+    Dims dims   = engine_->getTensorShape(inputName_.c_str());
     inputHeight_ = dims.d[2];
     inputWidth_  = dims.d[3];
 }
