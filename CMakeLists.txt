@@ -24,10 +24,12 @@ find_package(foxglove_msgs REQUIRED)
 # Find visualization_msgs
 find_package(visualization_msgs REQUIRED)
 
-# TensorRT paths — may need some adjustment
-set(TENSORRT_ROOT /usr/local/tensorrt)
-set(TENSORRT_INCLUDE_DIRS ${TENSORRT_ROOT}/include)
-set(TENSORRT_LIB_DIRS ${TENSORRT_ROOT}/lib)
+# TensorRT is installed via apt on Jetson, so it is in standard system paths.
+# I believe that we don't need to hardcode TENSORRT_ROOT, INCLUDE_DIRS, or LIB_DIRS.
+
+# set(TENSORRT_ROOT /usr/local/tensorrt)
+# set(TENSORRT_INCLUDE_DIRS ${TENSORRT_ROOT}/include)
+# set(TENSORRT_LIB_DIRS ${TENSORRT_ROOT}/lib)
 
 # Find ZED SDK
 find_package(ZED 3 REQUIRED)
@@ -43,7 +45,7 @@ add_executable(detection_center
 target_include_directories(detection_center PRIVATE
     include
     ${CUDA_INCLUDE_DIRS}
-    ${TENSORRT_INCLUDE_DIRS}
+    # ${TENSORRT_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
     ${ZED_INCLUDE_DIRS}
 )
@@ -53,7 +55,7 @@ target_link_libraries(detection_center
     ${CUDA_LIBRARIES}
     ${OpenCV_LIBS}
     ${ZED_LIBRARIES}
-    -L${TENSORRT_LIB_DIRS}
+    # -L${TENSORRT_LIB_DIRS}
     nvinfer
     cudart
 )
