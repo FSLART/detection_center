@@ -8,10 +8,10 @@ ZedCenter::ZedCenter(const rclcpp::NodeOptions& options, DetectionCenter& detect
     // https://www.stereolabs.com/docs/video/camera-controls
     InitParameters init_params;
     init_params.sdk_verbose = 1;
-    init_params.camera_resolution = RESOLUTION::HD1200;
+    init_params.camera_resolution = RESOLUTION::HD1080;
     init_params.depth_minimum_distance = 0.5;
     init_params.depth_maximum_distance = 25.0;
-    init_params.camera_fps = 30;
+    init_params.camera_fps = 60;
     init_params.coordinate_units = UNIT::METER;
     init_params.depth_mode = DEPTH_MODE::NEURAL_PLUS; // previous: PERFORMANCE, ULTRA, NEURAL_PLUS
     init_params.coordinate_system = COORDINATE_SYSTEM::RIGHT_HANDED_Z_UP_X_FWD;
@@ -273,7 +273,7 @@ void ZedCenter::publishImages()
             poly.thickness = 3.0;
 
             // Color marker and annotation based on class (same as zed_bridge.cpp)
-            switch (det.classId + 1)
+            switch (det.classId)
             {
             case 1: // Yellow
                 marker.color.r = 1.0; marker.color.g = 1.0; marker.color.b = 0.0; marker.color.a = 1.0;

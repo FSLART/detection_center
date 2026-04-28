@@ -16,7 +16,9 @@ find_package(rclcpp_components REQUIRED)
 find_package(OpenCV REQUIRED)
 
 # Find CUDA
-find_package(CUDA ${ZED_CUDA_VERSION} REQUIRED)
+# find_package(CUDA ${ZED_CUDA_VERSION} REQUIRED)
+find_package(CUDAToolkit REQUIRED)
+
 
 # Find foxglove_msgs
 find_package(foxglove_msgs REQUIRED)
@@ -52,12 +54,12 @@ target_include_directories(detection_center PRIVATE
 
 # Link libraries
 target_link_libraries(detection_center
-    ${CUDA_LIBRARIES}
+    CUDA::cudart
+    # ${CUDA_LIBRARIES}
     ${OpenCV_LIBS}
     ${ZED_LIBRARIES}
     # -L${TENSORRT_LIB_DIRS}
     nvinfer
-    cudart
 )
 
 # Link ROS2 dependencies

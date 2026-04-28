@@ -64,9 +64,6 @@ DetectionCenter::DetectionCenter(const std::string& enginePath) {
     inputName_  = engine_->getIOTensorName(0);
     outputName_ = engine_->getIOTensorName(1);
 
-    std::cout << "Input Binding Type (0=FP32, 1=FP16): " << (int)engine_->getTensorDataType(inputName_.c_str()) << std::endl;
-    std::cout << "Output Binding Type (0=FP32, 1=FP16): " << (int)engine_->getTensorDataType(outputName_.c_str()) << std::endl;
-
     Dims outDims = engine_->getTensorShape(outputName_.c_str()); // [batch_size, num_fields, num_anchors]
     numFields_  = outDims.d[1]; // 9 (4 coords + 5 classes)
     numAnchors_ = outDims.d[2];
@@ -116,7 +113,6 @@ DetectionCenter::~DetectionCenter() {
 }
 
 std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& frame) {
-    std::cout << "[DetectionCenter] Received frame for detection. Size: " << frame.cols << "x" << frame.rows << std::endl;
     // clear detection results from previous frames
     boxes_.clear();
     scores_.clear();
@@ -131,6 +127,8 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& f
     int channelSize = inputHeight_ * inputWidth_;
     for (int c = 0; c < 3; c++)
         memcpy(h_input_.data() + c * channelSize, channels_[c].data, channelSize * sizeof(uint16_t));
+    
+    auto start_time = std::chrono::high_resolution_clock::now();
 
     // 3. Run inference
     cudaError_t err = cudaMemcpyAsync(d_input_, h_input_.data(), inputSize_, cudaMemcpyHostToDevice, stream_);
@@ -150,10 +148,10 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& f
     err = cudaStreamSynchronize(stream_);
     if (err != cudaSuccess) {
         std::cerr << "[DetectionCenter] ERROR: cudaStreamSynchronize failed: " << cudaGetErrorString(err) << std::endl;
-    } else {
-        std::cout << "[DetectionCenter] Inference completed successfully." << std::endl;
     }
-
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Inference Time: %ld ms", duration.count() );
     // 4. Convert output back to float32 for processing
     cv::Mat output_fp16(1, h_output_.size(), CV_16F, h_output_.data());
     cv::Mat output_fp32;
@@ -172,9 +170,7 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& f
     cv::reduce(classScores, maxScores,  1, cv::REDUCE_MAX);  // max score per row
 
     double minScore, maxScore;
-    cv::minMaxLoc(maxScores, &minS  core, &maxScore);
-    std::cout << "[DetectionCenter] Max confidence out of all " << numAnchors_ 
-              << " anchors is: " << maxScore << std::endl;
+    cv::minMaxLoc(maxScores, &minScore, &maxScore);
 
     // Filter rows by confidence threshold in one shot
     cv::Mat mask = maxScores > 0.5f;
@@ -200,8 +196,6 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& f
         classIds_.emplace_back(classId);
     }
 
-    std::cout << "[DetectionCenter] Found " << boxes_.size() << " candidates before NMS." << std::endl;
-
     // NMS
     std::vector<int> indices;
     cv::dnn::NMSBoxes(boxes_, scores_, 0.5f, 0.45f, indices);
@@ -217,8 +211,6 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& f
         det.classId = classIds_[idx];
         detections.push_back(det);
     }
-
-    std::cout << "[DetectionCenter] Returning " << detections.size() << " final detections after NMS." << std::endl;
 
     return detections;
 }

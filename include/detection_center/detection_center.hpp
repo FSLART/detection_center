@@ -4,6 +4,8 @@
 #include <cuda_runtime_api.h>
 #include <vector>
 #include <cstdint>
+#include <rclcpp/rclcpp.hpp>
+#include <chrono>
 
 class DetectionCenter {
 public:
