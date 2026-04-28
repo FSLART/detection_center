@@ -273,7 +273,7 @@ void ZedCenter::publishImages()
             poly.thickness = 3.0;
 
             // Color marker and annotation based on class (same as zed_bridge.cpp)
-            switch (det.classId)
+            switch (det.classId + 1)
             {
             case 1: // Yellow
                 marker.color.r = 1.0; marker.color.g = 1.0; marker.color.b = 0.0; marker.color.a = 1.0;
