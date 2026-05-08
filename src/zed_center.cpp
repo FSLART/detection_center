@@ -11,7 +11,7 @@ ZedCenter::ZedCenter(const rclcpp::NodeOptions& options, DetectionCenter& detect
     init_params.camera_resolution = RESOLUTION::HD1080;
     init_params.depth_minimum_distance = 0.5;
     init_params.depth_maximum_distance = 25.0;
-    init_params.camera_fps = 60;
+    init_params.camera_fps = 30;
     init_params.coordinate_units = UNIT::METER;
     init_params.depth_mode = DEPTH_MODE::NEURAL_PLUS; // previous: PERFORMANCE, ULTRA, NEURAL_PLUS
     init_params.coordinate_system = COORDINATE_SYSTEM::RIGHT_HANDED_Z_UP_X_FWD;
@@ -224,13 +224,6 @@ void ZedCenter::publishImages()
             double obj_y = -X_cam;   // left
             double obj_z = -Y_cam;   // up
 
-            // STEP 5: Distance filter (squared to avoid sqrt, same as zed_bridge.cpp)
-            double distance_sq = obj_x * obj_x + obj_y * obj_y;
-            if (distance_sq < 0.25 || distance_sq > 650.0)  // 0.5m² to ~25.5m²
-            {
-                continue;
-            }
-
             // STEP 6: Apply transform matrix (camera → base_footprint)
             double transformed_x = transform_matrix_[0][0] * obj_x + transform_matrix_[0][1] * obj_y +
                                     transform_matrix_[0][2] * obj_z + transform_matrix_[0][3];
@@ -323,9 +316,15 @@ void ZedCenter::publishImages()
         }
 
         // Publish cone array, markers, and annotations
-        this->cone_array_pub->publish(std::move(cone_array));
         this->marker_array_pub->publish(std::move(marker_array));
         this->annotations_pub_->publish(annotations_msg);
+        // Distance filter (squared to avoid sqrt, same as zed_bridge.cpp)
+        double distance_sq = obj_x * obj_x + obj_y * obj_y;
+        if (distance_sq < 0.25 || distance_sq > 650.0)  // 0.5m² to ~25.5m²
+        {
+            continue;
+        }
+        this->cone_array_pub->publish(std::move(cone_array));
 
         // Publish depth image (same pattern as zed_bridge.cpp lines 404-432)
         depth_image_msg.header.stamp = timestamp;

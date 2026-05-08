@@ -152,6 +152,7 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& f
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Inference Time: %ld ms", duration.count() );
+    
     // 4. Convert output back to float32 for processing
     cv::Mat output_fp16(1, h_output_.size(), CV_16F, h_output_.data());
     cv::Mat output_fp32;
@@ -211,6 +212,8 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& f
         det.classId = classIds_[idx];
         detections.push_back(det);
     }
+
+    RCLCPP_INFO(rclcpp::get_logger("detection_center"), "BBoxes Found: %i", indices.size() );
 
     return detections;
 }
