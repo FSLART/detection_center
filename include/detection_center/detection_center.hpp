@@ -1,5 +1,6 @@
 #pragma once
 #include <opencv2/opencv.hpp>
+#include <opencv2/core/cuda.hpp>
 #include <NvInfer.h>
 #include <cuda_runtime_api.h>
 #include <vector>
@@ -20,6 +21,7 @@ public:
     ~DetectionCenter();
 
     std::vector<Detection> detect(const cv::Mat& frame);
+    std::vector<Detection> detect(const cv::cuda::GpuMat& gpu_frame);
 
 private:
     nvinfer1::IRuntime* runtime_;
@@ -48,4 +50,9 @@ private:
     std::vector<uint16_t> h_output_;
     cv::Mat resized_;
     std::vector<cv::Mat> channels_;
+
+    // GPU-resident buffers for CUDA pipeline
+    cv::cuda::GpuMat gpu_resized_;
+    cv::cuda::GpuMat gpu_normalized_;
+    std::vector<cv::cuda::GpuMat> gpu_channels_;
 };

@@ -6,6 +6,8 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <opencv2/opencv.hpp>
+#include <opencv2/core/cuda.hpp>
+#include <opencv2/cudaimgproc.hpp>
 #include <image_transport/image_transport.hpp>
 #include <cmath>
 #include <algorithm>
@@ -83,6 +85,10 @@ private:
 
     static int getOCVtype(sl::MAT_TYPE type);
     static cv::Mat slMat2cvMat(sl::Mat &input);
+
+    sl::Mat gpu_left_image_;          // ZED image stored on GPU
+    cv::cuda::GpuMat gpu_left_bgra_;  // Zero-copy GpuMat wrapper around ZED GPU memory
+    cv::cuda::GpuMat gpu_left_rgb_;   // Color-converted on GPU
 
     DetectionCenter& detector_;
 };

@@ -121,11 +121,11 @@ void ZedCenter::publishImages()
         this->last_capture_time = timestamp;
         this->last_image_time = std::chrono::steady_clock::now();
 
-        // retrieve the left image
-        sl::Mat left_image;
-        zed.retrieveImage(left_image, VIEW::LEFT);
+        // retrieve the left image directly on the GPU
+        zed.retrieveImage(gpu_left_image_, VIEW::LEFT, MEM::GPU);
 
         // Retrieve depth map (needed for 2D to 3D back-projection)
+        // Depth map stays on CPU since we only sample it sparsely
         sl::Mat depth_map;
         zed.retrieveMeasure(depth_map, sl::MEASURE::DEPTH);
         cv::Mat depth_cv = cv::Mat(depth_map.getHeight(), depth_map.getWidth(),
@@ -133,7 +133,6 @@ void ZedCenter::publishImages()
                                    depth_map.getStepBytes(MEM::CPU));
 
         // Pre-allocate reusable objects as static to avoid repeated allocations
-        static cv::Mat left_image_cv_bgra;
         static cv::Mat left_image_cv_rgb;
         static sensor_msgs::msg::Image left_image_msg;
         static sensor_msgs::msg::Image depth_image_msg;
@@ -147,9 +146,19 @@ void ZedCenter::publishImages()
         annotations_msg.points.clear();
         annotations_msg.texts.clear();
 
-        // convert the image to OpenCV format
-        left_image_cv_bgra = slMat2cvMat(left_image);
-        cv::cvtColor(left_image_cv_bgra, left_image_cv_rgb, cv::COLOR_BGRA2RGB);
+        // 1. Wrap ZED GPU memory as a cv::cuda::GpuMat (zero-copy, just a pointer)
+        gpu_left_bgra_ = cv::cuda::GpuMat(
+            gpu_left_image_.getHeight(), gpu_left_image_.getWidth(),
+            CV_8UC4,
+            gpu_left_image_.getPtr<sl::uchar1>(sl::MEM::GPU),
+            gpu_left_image_.getStepBytes(sl::MEM::GPU)
+        );
+
+        // 2. Convert BGRA → RGB on GPU
+        cv::cuda::cvtColor(gpu_left_bgra_, gpu_left_rgb_, cv::COLOR_BGRA2RGB);
+
+        // 3. Download the RGB image to CPU *only* for ROS message publishing
+        gpu_left_rgb_.download(left_image_cv_rgb);
 
         // convert the image to a ROS message
         left_image_msg.header.stamp = timestamp;
@@ -166,7 +175,8 @@ void ZedCenter::publishImages()
         this->left_info_pub->publish(left_camera_info_template);
 
         // --- Run YOLO inference (returns raw 2D detections) ---
-        auto detections = detector_.detect(left_image_cv_rgb);
+        // We pass the GPU image directly to the inference engine (Zero HostToDevice copy)
+        auto detections = detector_.detect(gpu_left_rgb_);
 
         // Cache camera intrinsics for back-projection
         const double fx = cached_calibration_params.left_cam.fx;
