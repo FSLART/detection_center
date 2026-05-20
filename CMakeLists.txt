@@ -15,10 +15,6 @@ find_package(cv_bridge REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(OpenCV REQUIRED)
 
-if(NOT OpenCV_CUDA_VERSION AND NOT DEFINED OpenCV_CUDA_VERSION)
-    message(WARNING "OpenCV was NOT built with CUDA support! The zero-copy GPU preprocessing pipeline will fail to compile. Please rebuild OpenCV with WITH_CUDA=ON.")
-endif()
-
 # Find CUDA
 # find_package(CUDA ${ZED_CUDA_VERSION} REQUIRED)
 find_package(CUDAToolkit REQUIRED)
