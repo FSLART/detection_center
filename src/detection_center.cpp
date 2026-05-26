@@ -115,6 +115,7 @@ DetectionCenter::~DetectionCenter() {
 }
 
 std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& frame) {
+
     // clear detection results from previous frames
     boxes_.clear();
     scores_.clear();
@@ -130,7 +131,7 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& f
     for (int c = 0; c < 3; c++)
         memcpy(h_input_.data() + c * channelSize, channels_[c].data, channelSize * sizeof(uint16_t));
     
-    auto start_time = std::chrono::high_resolution_clock::now();
+    auto start_time_infer = std::chrono::high_resolution_clock::now();
 
     // 3. Run inference
     cudaError_t err = cudaMemcpyAsync(d_input_, h_input_.data(), inputSize_, cudaMemcpyHostToDevice, stream_);
@@ -151,9 +152,9 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& f
     if (err != cudaSuccess) {
         std::cerr << "[DetectionCenter] ERROR: cudaStreamSynchronize failed: " << cudaGetErrorString(err) << std::endl;
     }
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Inference Time: %ld ms", duration.count() );
+    auto end_time_infer = std::chrono::high_resolution_clock::now();
+    auto duration_infer = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_infer - start_time_infer);
+    RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Inference Time: %ld ms", duration_infer.count() );
     
     // 4. Convert output back to float32 for processing
     cv::Mat output_fp16(1, h_output_.size(), CV_16F, h_output_.data());
@@ -216,11 +217,14 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::Mat& f
     }
 
     RCLCPP_INFO(rclcpp::get_logger("detection_center"), "BBoxes Found: %i", indices.size() );
-
+    
     return detections;
 }
 
 std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::cuda::GpuMat& gpu_frame) {
+    
+    auto start_time_detect = std::chrono::high_resolution_clock::now();
+
     // clear detection results from previous frames
     boxes_.clear();
     scores_.clear();
@@ -240,10 +244,13 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::cuda::
         );
     }
     cv::cuda::split(gpu_normalized_, gpu_channels_);
-    
-    auto start_time = std::chrono::high_resolution_clock::now();
 
-    // 3. Run inference (NO HostToDevice memory copy needed!)
+    // Sync OpenCV's default stream (stream 0) before TRT reads from d_input_ on stream_
+    cudaStreamSynchronize(0);
+    
+    auto start_time_infer = std::chrono::high_resolution_clock::now();
+
+    // 3. Run inference
     if (!context_->enqueueV3(stream_)) {
         std::cerr << "[DetectionCenter] ERROR: TensorRT enqueueV3 failed!" << std::endl;
     }
@@ -257,9 +264,9 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::cuda::
     if (err != cudaSuccess) {
         std::cerr << "[DetectionCenter] ERROR: cudaStreamSynchronize failed: " << cudaGetErrorString(err) << std::endl;
     }
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Inference Time (GPU Path): %ld ms", duration.count() );
+    auto end_time_infer = std::chrono::high_resolution_clock::now();
+    auto duration_infer = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_infer - start_time_infer);
+    RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Inference Time (GPU Path): %ld ms", duration_infer.count() );
     
     // 4. Convert output back to float32 for processing
     cv::Mat output_fp16(1, h_output_.size(), CV_16F, h_output_.data());
@@ -322,6 +329,10 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::cuda::
     }
 
     RCLCPP_INFO(rclcpp::get_logger("detection_center"), "BBoxes Found (GPU Path): %li", indices.size() );
+
+    auto end_time_detect = std::chrono::high_resolution_clock::now();
+    auto duration_detect = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_detect - start_time_detect);
+    RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Detection Call Time: %ld ms", duration_detect.count() );
 
     return detections;
 }

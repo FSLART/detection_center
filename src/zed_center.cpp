@@ -8,7 +8,7 @@ ZedCenter::ZedCenter(const rclcpp::NodeOptions& options, DetectionCenter& detect
     // https://www.stereolabs.com/docs/video/camera-controls
     InitParameters init_params;
     init_params.sdk_verbose = 1;
-    init_params.camera_resolution = RESOLUTION::HD1080;
+    init_params.camera_resolution = RESOLUTION::HD1200;
     init_params.depth_minimum_distance = 0.5;
     init_params.depth_maximum_distance = 25.0;
     init_params.camera_fps = 30;
@@ -112,6 +112,7 @@ void ZedCenter::setupCameraInfoTemplates()
 
 void ZedCenter::publishImages()
 {
+    auto start_time_frame = std::chrono::high_resolution_clock::now();
     auto err = zed.grab(this->runtime_parameters);
 
     if (err == ERROR_CODE::SUCCESS)
@@ -234,6 +235,9 @@ void ZedCenter::publishImages()
             double obj_y = -X_cam;   // left
             double obj_z = -Y_cam;   // up
 
+            // Distance filter (squared to avoid sqrt, same as zed_bridge.cpp)
+            double distance_sq = obj_x * obj_x + obj_y * obj_y;
+
             // STEP 6: Apply transform matrix (camera → base_footprint)
             double transformed_x = transform_matrix_[0][0] * obj_x + transform_matrix_[0][1] * obj_y +
                                     transform_matrix_[0][2] * obj_z + transform_matrix_[0][3];
@@ -241,14 +245,16 @@ void ZedCenter::publishImages()
                                     transform_matrix_[1][2] * obj_z + transform_matrix_[1][3];
 
             // --- Create Cone message ---
-            lart_msgs::msg::Cone cone;
-            cone.header.frame_id = "base_footprint";
-            cone.position.x = transformed_x;
-            cone.position.y = transformed_y;
-            cone.position.z = 0.0;
-            cone.class_type.data = det.classId;
-
-            cone_array.cones.push_back(std::move(cone));
+            if (distance_sq >= 0.25 && distance_sq <= 650.0)  // 0.5m to ~25.5m
+            {
+                lart_msgs::msg::Cone cone;
+                cone.header.frame_id = "base_footprint";
+                cone.position.x = transformed_x;
+                cone.position.y = transformed_y;
+                cone.position.z = 0.0;
+                cone.class_type.data = det.classId;
+                cone_array.cones.push_back(std::move(cone));
+            }
 
             // --- Create Marker ---
             visualization_msgs::msg::Marker marker;
@@ -326,16 +332,9 @@ void ZedCenter::publishImages()
         }
 
         // Publish cone array, markers, and annotations
+        this->cone_array_pub->publish(std::move(cone_array));
         this->marker_array_pub->publish(std::move(marker_array));
         this->annotations_pub_->publish(annotations_msg);
-        // Distance filter (squared to avoid sqrt, same as zed_bridge.cpp)
-        double distance_sq = obj_x * obj_x + obj_y * obj_y;
-        if (distance_sq < 0.25 || distance_sq > 650.0)  // 0.5m² to ~25.5m²
-        {
-            continue;
-        }
-        this->cone_array_pub->publish(std::move(cone_array));
-
         // Publish depth image (same pattern as zed_bridge.cpp lines 404-432)
         depth_image_msg.header.stamp = timestamp;
         depth_image_msg.header.frame_id = LEFT_IMG_FRAME_ID;
@@ -370,6 +369,9 @@ void ZedCenter::publishImages()
             this->emergency_pub->publish(emergency);
         }
     }
+    auto end_time_frame = std::chrono::high_resolution_clock::now();
+    auto duration_frame = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_frame - start_time_frame);
+    RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Frame Processing Time: %ld ms", duration_frame.count() );
 }
 
 // Mapping between MAT_TYPE and CV_TYPE
