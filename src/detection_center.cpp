@@ -1,9 +1,7 @@
 #include "detection_center/detection_center.hpp"
 #include <fstream>
 #include <iostream>
-#include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudawarping.hpp>
-#include <opencv2/cudaarithm.hpp>
 
 using namespace nvinfer1;
 
@@ -231,45 +229,53 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::cuda::
     scores_.clear();
     classIds_.clear();
 
-    // 1. Resize on GPU
+    // 1. Resize on GPU (fast: avoids resizing full 1920x1200 on CPU)
     cv::cuda::resize(gpu_frame, gpu_resized_, cv::Size(inputWidth_, inputHeight_));
 
-    // 2. Normalize to FP32 (OpenCV CUDA handles FP32 correctly, CV_16F is broken with scale)
-    cv::cuda::GpuMat gpu_fp32;
-    gpu_resized_.convertTo(gpu_fp32, CV_32FC3, 1.0 / 255.0);
+    // 2. Download the small resized image to CPU, then use the proven CPU preprocessing
+    //    from commit 3d51f35 (the "its working" commit). The image is now only 640x640,
+    //    so this download is very cheap (~1.2MB vs ~6.9MB for the full-res image).
+    gpu_resized_.download(resized_);
+    resized_.convertTo(resized_, CV_16F, 1.0 / 255.0);
 
-    // 3. Split into 3 FP32 channels
-    std::vector<cv::cuda::GpuMat> f32_channels(3);
-    cv::cuda::split(gpu_fp32, f32_channels);
-
-    // 4. Convert each FP32 channel to FP16 (let OpenCV allocate its own padded buffer)
-    //    then copy the valid pixels into our contiguous d_input_ buffer
+    // 3. Convert HWC → CHW (same proven logic as the CPU detect() path)
+    cv::split(resized_, channels_);
     int channelSize = inputHeight_ * inputWidth_;
-    for (int c = 0; c < 3; c++) {
-        cv::cuda::GpuMat f16_chan;
-        f32_channels[c].convertTo(f16_chan, CV_16F);
+    for (int c = 0; c < 3; c++)
+        memcpy(h_input_.data() + c * channelSize, channels_[c].data, channelSize * sizeof(uint16_t));
 
-        cudaMemcpy2DAsync(
-            static_cast<uint16_t*>(d_input_) + c * channelSize,  // contiguous dest
-            inputWidth_ * sizeof(uint16_t),                       // dest pitch (no padding)
-            f16_chan.data,                                        // padded source
-            f16_chan.step,                                        // source pitch (with padding)
-            inputWidth_ * sizeof(uint16_t),                       // bytes per row to copy
-            inputHeight_,                                         // number of rows
-            cudaMemcpyDeviceToDevice,
-            stream_
-        );
+    // 4. Upload prepared FP16 CHW tensor to GPU
+    cudaError_t upload_err = cudaMemcpyAsync(d_input_, h_input_.data(), inputSize_, cudaMemcpyHostToDevice, stream_);
+    if (upload_err != cudaSuccess) {
+        std::cerr << "[DetectionCenter] ERROR: cudaMemcpyAsync (Host->Device) failed: " << cudaGetErrorString(upload_err) << std::endl;
     }
-    cudaStreamSynchronize(stream_);
+
+    // --- OLD GPU preprocessing (broken: produces corrupted FP16 data, zero detections) ---
+    // cv::cuda::GpuMat gpu_fp32;
+    // gpu_resized_.convertTo(gpu_fp32, CV_32FC3, 1.0 / 255.0);
+    // std::vector<cv::cuda::GpuMat> f32_channels(3);
+    // cv::cuda::split(gpu_fp32, f32_channels);
+    // int channelSize = inputHeight_ * inputWidth_;
+    // std::vector<cv::cuda::GpuMat> f16_channels(3);
+    // for (int c = 0; c < 3; c++) {
+    //     f32_channels[c].convertTo(f16_channels[c], CV_16F);
+    //     cudaMemcpy2DAsync(
+    //         static_cast<uint16_t*>(d_input_) + c * channelSize,
+    //         inputWidth_ * sizeof(uint16_t),
+    //         f16_channels[c].data, f16_channels[c].step,
+    //         inputWidth_ * sizeof(uint16_t), inputHeight_,
+    //         cudaMemcpyDeviceToDevice, 0);
+    // }
+    // cudaStreamSynchronize(0);
     
     auto start_time_infer = std::chrono::high_resolution_clock::now();
 
-    // 3. Run inference
+    // 5. Run inference
     if (!context_->enqueueV3(stream_)) {
         std::cerr << "[DetectionCenter] ERROR: TensorRT enqueueV3 failed!" << std::endl;
     }
 
-    // 5. Download FP16 output to CPU and convert there (safe, proven, fast for ~150KB)
+    // 6. Download FP16 output to CPU and convert there (safe, proven, fast for ~150KB)
     cudaError_t err = cudaMemcpyAsync(h_output_.data(), d_output_, outputSize_,
                                        cudaMemcpyDeviceToHost, stream_);
     if (err != cudaSuccess) {
@@ -284,7 +290,7 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::cuda::
     auto duration_infer = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_infer - start_time_infer);
     RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Inference Time (GPU Path): %ld ms", duration_infer.count() );
 
-    // 6. Convert output FP16 → FP32
+    // 7. Convert output FP16 → FP32
     // --- Option A: Native ARM hardware cast (potentially faster, bypasses OpenCV emulation) ---
     cv::Mat output_fp32(1, h_output_.size(), CV_32F);
     __fp16* raw_fp16 = reinterpret_cast<__fp16*>(h_output_.data());

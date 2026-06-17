@@ -51,8 +51,6 @@ private:
     cv::Mat resized_;
     std::vector<cv::Mat> channels_;
 
-    // GPU-resident buffers for CUDA pipeline
+    // GPU-resident buffer for CUDA resize
     cv::cuda::GpuMat gpu_resized_;
-    cv::cuda::GpuMat gpu_normalized_;
-    std::vector<cv::cuda::GpuMat> gpu_channels_;
 };

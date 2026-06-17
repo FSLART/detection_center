@@ -254,7 +254,7 @@ void ZedCenter::publishImages()
             // Distance filter (squared to avoid sqrt, same as zed_bridge.cpp)
             double distance_sq = obj_x * obj_x + obj_y * obj_y;
 
-            // STEP 6: Apply transform matrix (camera → base_footprint)
+            // STEP 5: Apply transform matrix (camera → base_footprint)
             double transformed_x = transform_matrix_[0][0] * obj_x + transform_matrix_[0][1] * obj_y +
                                     transform_matrix_[0][2] * obj_z + transform_matrix_[0][3];
             double transformed_y = transform_matrix_[1][0] * obj_x + transform_matrix_[1][1] * obj_y +
