@@ -3,6 +3,7 @@
 #include <iostream>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudawarping.hpp>
+#include <opencv2/cudaarithm.hpp>
 
 using namespace nvinfer1;
 
@@ -230,23 +231,36 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::cuda::
     scores_.clear();
     classIds_.clear();
 
-    // 1. Preprocess: resize and normalize on GPU
+    // 1. Resize on GPU
     cv::cuda::resize(gpu_frame, gpu_resized_, cv::Size(inputWidth_, inputHeight_));
-    gpu_resized_.convertTo(gpu_normalized_, CV_16FC3, 1.0 / 255.0);
 
-    // 2. Convert HWC → CHW directly into d_input_
+    // 2. Normalize to FP32 (OpenCV CUDA handles FP32 correctly, CV_16F is broken with scale)
+    cv::cuda::GpuMat gpu_fp32;
+    gpu_resized_.convertTo(gpu_fp32, CV_32FC3, 1.0 / 255.0);
+
+    // 3. Split into 3 FP32 channels
+    std::vector<cv::cuda::GpuMat> f32_channels(3);
+    cv::cuda::split(gpu_fp32, f32_channels);
+
+    // 4. Convert each FP32 channel to FP16 (let OpenCV allocate its own padded buffer)
+    //    then copy the valid pixels into our contiguous d_input_ buffer
     int channelSize = inputHeight_ * inputWidth_;
-    gpu_channels_.resize(3);
     for (int c = 0; c < 3; c++) {
-        gpu_channels_[c] = cv::cuda::GpuMat(
-            inputHeight_, inputWidth_, CV_16FC1,
-            static_cast<uint16_t*>(d_input_) + c * channelSize
+        cv::cuda::GpuMat f16_chan;
+        f32_channels[c].convertTo(f16_chan, CV_16F);
+
+        cudaMemcpy2DAsync(
+            static_cast<uint16_t*>(d_input_) + c * channelSize,  // contiguous dest
+            inputWidth_ * sizeof(uint16_t),                       // dest pitch (no padding)
+            f16_chan.data,                                        // padded source
+            f16_chan.step,                                        // source pitch (with padding)
+            inputWidth_ * sizeof(uint16_t),                       // bytes per row to copy
+            inputHeight_,                                         // number of rows
+            cudaMemcpyDeviceToDevice,
+            stream_
         );
     }
-    cv::cuda::split(gpu_normalized_, gpu_channels_);
-
-    // Sync OpenCV's default stream (stream 0) before TRT reads from d_input_ on stream_
-    cudaStreamSynchronize(0);
+    cudaStreamSynchronize(stream_);
     
     auto start_time_infer = std::chrono::high_resolution_clock::now();
 
@@ -255,7 +269,9 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::cuda::
         std::cerr << "[DetectionCenter] ERROR: TensorRT enqueueV3 failed!" << std::endl;
     }
 
-    cudaError_t err = cudaMemcpyAsync(h_output_.data(), d_output_, outputSize_, cudaMemcpyDeviceToHost, stream_);
+    // 5. Download FP16 output to CPU and convert there (safe, proven, fast for ~150KB)
+    cudaError_t err = cudaMemcpyAsync(h_output_.data(), d_output_, outputSize_,
+                                       cudaMemcpyDeviceToHost, stream_);
     if (err != cudaSuccess) {
         std::cerr << "[DetectionCenter] ERROR: cudaMemcpyAsync (Device->Host) failed: " << cudaGetErrorString(err) << std::endl;
     }
@@ -267,11 +283,20 @@ std::vector<DetectionCenter::Detection> DetectionCenter::detect(const cv::cuda::
     auto end_time_infer = std::chrono::high_resolution_clock::now();
     auto duration_infer = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_infer - start_time_infer);
     RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Inference Time (GPU Path): %ld ms", duration_infer.count() );
-    
-    // 4. Convert output back to float32 for processing
-    cv::Mat output_fp16(1, h_output_.size(), CV_16F, h_output_.data());
-    cv::Mat output_fp32;
-    output_fp16.convertTo(output_fp32, CV_32F);
+
+    // 6. Convert output FP16 → FP32
+    // --- Option A: Native ARM hardware cast (potentially faster, bypasses OpenCV emulation) ---
+    cv::Mat output_fp32(1, h_output_.size(), CV_32F);
+    __fp16* raw_fp16 = reinterpret_cast<__fp16*>(h_output_.data());
+    float* out_fp32_ptr = output_fp32.ptr<float>();
+    int total_elements = h_output_.size();
+    for (int i = 0; i < total_elements; ++i) {
+        out_fp32_ptr[i] = static_cast<float>(raw_fp16[i]);
+    }
+    // --- Option B: Original OpenCV path (uncomment if Option A causes issues) ---
+    // cv::Mat output_fp16(1, h_output_.size(), CV_16F, h_output_.data());
+    // cv::Mat output_fp32;
+    // output_fp16.convertTo(output_fp32, CV_32F);
 
     // ------------------------ Decode boxes, NMS ------------------------
 

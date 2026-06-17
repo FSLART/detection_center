@@ -112,8 +112,16 @@ void ZedCenter::setupCameraInfoTemplates()
 
 void ZedCenter::publishImages()
 {
+    // Easy to adjust: set to 1 to publish every frame (disables skip entirely)
+    static constexpr int IMAGE_PUBLISH_EVERY_N_FRAMES = 3;
+
     auto start_time_frame = std::chrono::high_resolution_clock::now();
+
+    auto start_grab = std::chrono::high_resolution_clock::now();
     auto err = zed.grab(this->runtime_parameters);
+    auto end_grab = std::chrono::high_resolution_clock::now();
+    RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Grab Time: %ld ms",
+        std::chrono::duration_cast<std::chrono::milliseconds>(end_grab - start_grab).count());
 
     if (err == ERROR_CODE::SUCCESS)
     {
@@ -158,25 +166,33 @@ void ZedCenter::publishImages()
         // 2. Convert BGRA → RGB on GPU
         cv::cuda::cvtColor(gpu_left_bgra_, gpu_left_rgb_, cv::COLOR_BGRA2RGB);
 
-        // 3. Download the RGB image to CPU *only* for ROS message publishing
-        gpu_left_rgb_.download(left_image_cv_rgb);
+        // 3. Only download and publish the image on selected frames (JPEG compress is expensive)
+        if (this->frame_counter % IMAGE_PUBLISH_EVERY_N_FRAMES == 0) {
+            gpu_left_rgb_.download(left_image_cv_rgb);
 
-        // convert the image to a ROS message
-        left_image_msg.header.stamp = timestamp;
-        left_image_msg.header.frame_id = LEFT_IMG_FRAME_ID;
-        left_image_msg.height = left_image_cv_rgb.rows;
-        left_image_msg.width = left_image_cv_rgb.cols;
-        left_image_msg.encoding = "rgb8";
-        left_image_msg.step = left_image_cv_rgb.step;
+            // convert the image to a ROS message
+            left_image_msg.header.stamp = timestamp;
+            left_image_msg.header.frame_id = LEFT_IMG_FRAME_ID;
+            left_image_msg.height = left_image_cv_rgb.rows;
+            left_image_msg.width = left_image_cv_rgb.cols;
+            left_image_msg.encoding = "rgb8";
+            left_image_msg.step = left_image_cv_rgb.step;
 
-        left_image_msg.data.assign(left_image_cv_rgb.data, left_image_cv_rgb.data + left_image_cv_rgb.rows * left_image_cv_rgb.cols * left_image_cv_rgb.channels());
-        
-        left_camera_info_template.header.stamp = timestamp;
-        this->left_image_pub.publish(left_image_msg);
-        this->left_info_pub->publish(left_camera_info_template);
+            left_image_msg.data.assign(left_image_cv_rgb.data, left_image_cv_rgb.data + left_image_cv_rgb.rows * left_image_cv_rgb.cols * left_image_cv_rgb.channels());
+            
+            left_camera_info_template.header.stamp = timestamp;
+
+            auto start_pub = std::chrono::high_resolution_clock::now();
+            this->left_image_pub.publish(left_image_msg);
+            auto end_pub = std::chrono::high_resolution_clock::now();
+            RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Image Publish Time: %ld ms",
+                std::chrono::duration_cast<std::chrono::milliseconds>(end_pub - start_pub).count());
+
+            this->left_info_pub->publish(left_camera_info_template);
+        }
 
         // --- Run YOLO inference (returns raw 2D detections) ---
-        // We pass the GPU image directly to the inference engine (Zero HostToDevice copy)
+        // Detection ALWAYS runs, regardless of whether we published the image
         auto detections = detector_.detect(gpu_left_rgb_);
 
         // Cache camera intrinsics for back-projection
