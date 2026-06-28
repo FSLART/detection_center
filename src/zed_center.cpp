@@ -11,9 +11,9 @@ ZedCenter::ZedCenter(const rclcpp::NodeOptions& options, DetectionCenter& detect
     init_params.camera_resolution = RESOLUTION::HD1200;
     init_params.depth_minimum_distance = 0.5;
     init_params.depth_maximum_distance = 25.0;
-    init_params.camera_fps = 30;
+    init_params.camera_fps = 60;
     init_params.coordinate_units = UNIT::METER;
-    init_params.depth_mode = DEPTH_MODE::NEURAL_PLUS; // previous: PERFORMANCE, ULTRA, NEURAL_PLUS
+    init_params.depth_mode = DEPTH_MODE::NEURAL; // previous: PERFORMANCE, ULTRA, NEURAL_PLUS
     init_params.coordinate_system = COORDINATE_SYSTEM::RIGHT_HANDED_Z_UP_X_FWD;
     init_params.enable_right_side_measure = true;
     init_params.depth_stabilization = true;
@@ -78,7 +78,7 @@ ZedCenter::ZedCenter(const rclcpp::NodeOptions& options, DetectionCenter& detect
     this->timestamp_service_ = this->create_service<lart_msgs::srv::Heartbeat>("zed/last_timestamp", std::bind(&ZedCenter::handle_timestamp_request, this, std::placeholders::_1, std::placeholders::_2));
 
     timer_ = this->create_wall_timer(
-        std::chrono::milliseconds(30), 
+        std::chrono::milliseconds(16), 
         std::bind(&ZedCenter::publishImages, this)
     );
 }
