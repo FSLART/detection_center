@@ -48,4 +48,7 @@ private:
     std::vector<uint16_t> h_output_;
     cv::Mat resized_;
     std::vector<cv::Mat> channels_;
+
+    // GPU-resident buffer for CUDA resize
+    cv::cuda::GpuMat gpu_resized_;
 };

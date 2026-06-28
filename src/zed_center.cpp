@@ -8,12 +8,12 @@ ZedCenter::ZedCenter(const rclcpp::NodeOptions& options, DetectionCenter& detect
     // https://www.stereolabs.com/docs/video/camera-controls
     InitParameters init_params;
     init_params.sdk_verbose = 1;
-    init_params.camera_resolution = RESOLUTION::HD1080;
+    init_params.camera_resolution = RESOLUTION::HD1200;
     init_params.depth_minimum_distance = 0.5;
     init_params.depth_maximum_distance = 25.0;
-    init_params.camera_fps = 30;
+    init_params.camera_fps = 60;
     init_params.coordinate_units = UNIT::METER;
-    init_params.depth_mode = DEPTH_MODE::NEURAL_PLUS; // previous: PERFORMANCE, ULTRA, NEURAL_PLUS
+    init_params.depth_mode = DEPTH_MODE::NEURAL; // previous: PERFORMANCE, ULTRA, NEURAL_PLUS
     init_params.coordinate_system = COORDINATE_SYSTEM::RIGHT_HANDED_Z_UP_X_FWD;
     init_params.enable_right_side_measure = true;
     init_params.depth_stabilization = true;
@@ -78,7 +78,7 @@ ZedCenter::ZedCenter(const rclcpp::NodeOptions& options, DetectionCenter& detect
     this->timestamp_service_ = this->create_service<lart_msgs::srv::Heartbeat>("zed/last_timestamp", std::bind(&ZedCenter::handle_timestamp_request, this, std::placeholders::_1, std::placeholders::_2));
 
     timer_ = this->create_wall_timer(
-        std::chrono::milliseconds(30), 
+        std::chrono::milliseconds(16), 
         std::bind(&ZedCenter::publishImages, this)
     );
 }
@@ -112,7 +112,16 @@ void ZedCenter::setupCameraInfoTemplates()
 
 void ZedCenter::publishImages()
 {
+    // Easy to adjust: set to 1 to publish every frame (disables skip entirely)
+    static constexpr int IMAGE_PUBLISH_EVERY_N_FRAMES = 3;
+
+    auto start_time_frame = std::chrono::high_resolution_clock::now();
+
+    auto start_grab = std::chrono::high_resolution_clock::now();
     auto err = zed.grab(this->runtime_parameters);
+    auto end_grab = std::chrono::high_resolution_clock::now();
+    RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Grab Time: %ld ms",
+        std::chrono::duration_cast<std::chrono::milliseconds>(end_grab - start_grab).count());
 
     if (err == ERROR_CODE::SUCCESS)
     {
@@ -151,22 +160,37 @@ void ZedCenter::publishImages()
         left_image_cv_bgra = slMat2cvMat(left_image);
         cv::cvtColor(left_image_cv_bgra, left_image_cv_rgb, cv::COLOR_BGRA2RGB);
 
-        // convert the image to a ROS message
-        left_image_msg.header.stamp = timestamp;
-        left_image_msg.header.frame_id = LEFT_IMG_FRAME_ID;
-        left_image_msg.height = left_image_cv_rgb.rows;
-        left_image_msg.width = left_image_cv_rgb.cols;
-        left_image_msg.encoding = "rgb8";
-        left_image_msg.step = left_image_cv_rgb.step;
+        // 2. Convert BGRA → RGB on GPU
+        cv::cuda::cvtColor(gpu_left_bgra_, gpu_left_rgb_, cv::COLOR_BGRA2RGB);
 
-        left_image_msg.data.assign(left_image_cv_rgb.data, left_image_cv_rgb.data + left_image_cv_rgb.rows * left_image_cv_rgb.cols * left_image_cv_rgb.channels());
-        
-        left_camera_info_template.header.stamp = timestamp;
-        this->left_image_pub.publish(left_image_msg);
-        this->left_info_pub->publish(left_camera_info_template);
+        // 3. Only download and publish the image on selected frames (JPEG compress is expensive)
+        if (this->frame_counter % IMAGE_PUBLISH_EVERY_N_FRAMES == 0) {
+            gpu_left_rgb_.download(left_image_cv_rgb);
+
+            // convert the image to a ROS message
+            left_image_msg.header.stamp = timestamp;
+            left_image_msg.header.frame_id = LEFT_IMG_FRAME_ID;
+            left_image_msg.height = left_image_cv_rgb.rows;
+            left_image_msg.width = left_image_cv_rgb.cols;
+            left_image_msg.encoding = "rgb8";
+            left_image_msg.step = left_image_cv_rgb.step;
+
+            left_image_msg.data.assign(left_image_cv_rgb.data, left_image_cv_rgb.data + left_image_cv_rgb.rows * left_image_cv_rgb.cols * left_image_cv_rgb.channels());
+            
+            left_camera_info_template.header.stamp = timestamp;
+
+            auto start_pub = std::chrono::high_resolution_clock::now();
+            this->left_image_pub.publish(left_image_msg);
+            auto end_pub = std::chrono::high_resolution_clock::now();
+            RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Image Publish Time: %ld ms",
+                std::chrono::duration_cast<std::chrono::milliseconds>(end_pub - start_pub).count());
+
+            this->left_info_pub->publish(left_camera_info_template);
+        }
 
         // --- Run YOLO inference (returns raw 2D detections) ---
-        auto detections = detector_.detect(left_image_cv_rgb);
+        // Detection ALWAYS runs, regardless of whether we published the image
+        auto detections = detector_.detect(gpu_left_rgb_);
 
         // Cache camera intrinsics for back-projection
         const double fx = cached_calibration_params.left_cam.fx;
@@ -224,21 +248,26 @@ void ZedCenter::publishImages()
             double obj_y = -X_cam;   // left
             double obj_z = -Y_cam;   // up
 
-            // STEP 6: Apply transform matrix (camera → base_footprint)
+            // Distance filter (squared to avoid sqrt, same as zed_bridge.cpp)
+            double distance_sq = obj_x * obj_x + obj_y * obj_y;
+
+            // STEP 5: Apply transform matrix (camera → base_footprint)
             double transformed_x = transform_matrix_[0][0] * obj_x + transform_matrix_[0][1] * obj_y +
                                     transform_matrix_[0][2] * obj_z + transform_matrix_[0][3];
             double transformed_y = transform_matrix_[1][0] * obj_x + transform_matrix_[1][1] * obj_y +
                                     transform_matrix_[1][2] * obj_z + transform_matrix_[1][3];
 
             // --- Create Cone message ---
-            lart_msgs::msg::Cone cone;
-            cone.header.frame_id = "base_footprint";
-            cone.position.x = transformed_x;
-            cone.position.y = transformed_y;
-            cone.position.z = 0.0;
-            cone.class_type.data = det.classId;
-
-            cone_array.cones.push_back(std::move(cone));
+            if (distance_sq >= 0.25 && distance_sq <= 650.0)  // 0.5m to ~25.5m
+            {
+                lart_msgs::msg::Cone cone;
+                cone.header.frame_id = "base_footprint";
+                cone.position.x = transformed_x;
+                cone.position.y = transformed_y;
+                cone.position.z = 0.0;
+                cone.class_type.data = det.classId;
+                cone_array.cones.push_back(std::move(cone));
+            }
 
             // --- Create Marker ---
             visualization_msgs::msg::Marker marker;
@@ -316,16 +345,9 @@ void ZedCenter::publishImages()
         }
 
         // Publish cone array, markers, and annotations
+        this->cone_array_pub->publish(std::move(cone_array));
         this->marker_array_pub->publish(std::move(marker_array));
         this->annotations_pub_->publish(annotations_msg);
-        // Distance filter (squared to avoid sqrt, same as zed_bridge.cpp)
-        double distance_sq = obj_x * obj_x + obj_y * obj_y;
-        if (distance_sq < 0.25 || distance_sq > 650.0)  // 0.5m² to ~25.5m²
-        {
-            continue;
-        }
-        this->cone_array_pub->publish(std::move(cone_array));
-
         // Publish depth image (same pattern as zed_bridge.cpp lines 404-432)
         depth_image_msg.header.stamp = timestamp;
         depth_image_msg.header.frame_id = LEFT_IMG_FRAME_ID;
@@ -360,6 +382,9 @@ void ZedCenter::publishImages()
             this->emergency_pub->publish(emergency);
         }
     }
+    auto end_time_frame = std::chrono::high_resolution_clock::now();
+    auto duration_frame = std::chrono::duration_cast<std::chrono::milliseconds>(end_time_frame - start_time_frame);
+    RCLCPP_INFO(rclcpp::get_logger("detection_center"), "Frame Processing Time: %ld ms", duration_frame.count() );
 }
 
 // Mapping between MAT_TYPE and CV_TYPE
