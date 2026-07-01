@@ -9,6 +9,7 @@
 #include <image_transport/image_transport.hpp>
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include "rclcpp_components/register_node_macro.hpp"
 #include <lart_msgs/msg/state.hpp>
 #include <lart_msgs/srv/heartbeat.hpp>
@@ -48,20 +49,16 @@ private:
     
     rclcpp::Publisher<lart_msgs::msg::State>::SharedPtr emergency_pub;
 
-    // Camera info templates
+    // Camera info template
     sensor_msgs::msg::CameraInfo left_camera_info_template;
-    sensor_msgs::msg::CameraInfo depth_camera_info_template;
 
     void setupCameraInfoTemplates();
 
-    // std::shared_ptr<image_transport::ImageTransport> it; // Declare the ImageTransport object
-    image_transport::Publisher left_image_pub;  // Declare the publisher for the left image
-    image_transport::Publisher depth_image_pub; // Declare the publisher for the depth image
-
-    // rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr left_image_pub;
-    // rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr depth_image_pub;
+    image_transport::Publisher left_image_pub;
     rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr left_info_pub;
-    rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr depth_info_pub;
+
+    // Homography matrix (row-major 3x3, loaded from ROS parameter)
+    std::array<double, 9> homography_matrix_;
 
     // for latency measure
     // std::vector<long long> latencies;

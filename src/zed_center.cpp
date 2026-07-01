@@ -9,19 +9,14 @@ ZedCenter::ZedCenter(const rclcpp::NodeOptions& options, DetectionCenter& detect
     InitParameters init_params;
     init_params.sdk_verbose = 1;
     init_params.camera_resolution = RESOLUTION::HD1200;
-    init_params.depth_minimum_distance = 0.5;
-    init_params.depth_maximum_distance = 25.0;
     init_params.camera_fps = 60;
     init_params.coordinate_units = UNIT::METER;
-    init_params.depth_mode = DEPTH_MODE::NEURAL; // previous: PERFORMANCE, ULTRA, NEURAL_PLUS
+    init_params.depth_mode = DEPTH_MODE::NONE;
     init_params.coordinate_system = COORDINATE_SYSTEM::RIGHT_HANDED_Z_UP_X_FWD;
     init_params.enable_right_side_measure = true;
-    init_params.depth_stabilization = true;
 
     // set runtime parameters
-    this->runtime_parameters.enable_depth = true;
-    this->runtime_parameters.enable_fill_mode = false;
-    this->runtime_parameters.confidence_threshold = 70;
+    this->runtime_parameters.enable_depth = false;
 
     // open the camera
     auto err = this->zed.open(init_params);
@@ -51,14 +46,18 @@ ZedCenter::ZedCenter(const rclcpp::NodeOptions& options, DetectionCenter& detect
     this->frame_counter = 0;
 
     this->left_image_pub = image_transport::create_publisher(this, "/zed/left/image_raw");
-    this->depth_image_pub = image_transport::create_publisher(this, "/zed/depth/image_raw");
-
     this->left_info_pub = this->create_publisher<sensor_msgs::msg::CameraInfo>("/zed/left/camera_info", 10);
-    this->depth_info_pub = this->create_publisher<sensor_msgs::msg::CameraInfo>("/zed/depth/camera_info", 10);
 
     this->cone_array_pub = this->create_publisher<lart_msgs::msg::ConeArray>("/mapping/cones", 10);
     this->marker_array_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("/mapping/cones_markers", 10);
     this->annotations_pub_ = this->create_publisher<foxglove_msgs::msg::ImageAnnotations>("/zed/image_annotations", 10);
+
+    // Load Homography matrix from ROS parameter (9 values, row-major 3x3)
+    this->declare_parameter("homography_matrix", std::vector<double>(9, 0.0));
+    auto h_vec = this->get_parameter("homography_matrix").as_double_array();
+    for (size_t i = 0; i < 9; ++i) {
+        this->homography_matrix_[i] = h_vec[i];
+    }
     
     // Cache camera info once instead of getting it every frame
     this->cached_camera_info = zed.getCameraInformation();
@@ -105,9 +104,6 @@ void ZedCenter::setupCameraInfoTemplates()
     left_camera_info_template.p[5] = cached_calibration_params.left_cam.fy;
     left_camera_info_template.p[6] = cached_calibration_params.left_cam.cy;
     left_camera_info_template.p[10] = 1.0;
-
-    // Copy for depth camera info template
-    depth_camera_info_template = left_camera_info_template;
 }
 
 void ZedCenter::publishImages()
@@ -134,18 +130,10 @@ void ZedCenter::publishImages()
         sl::Mat left_image;
         zed.retrieveImage(left_image, VIEW::LEFT);
 
-        // Retrieve depth map (needed for 2D to 3D back-projection)
-        sl::Mat depth_map;
-        zed.retrieveMeasure(depth_map, sl::MEASURE::DEPTH);
-        cv::Mat depth_cv = cv::Mat(depth_map.getHeight(), depth_map.getWidth(),
-                                   CV_32FC1, depth_map.getPtr<sl::uchar1>(MEM::CPU),
-                                   depth_map.getStepBytes(MEM::CPU));
-
         // Pre-allocate reusable objects as static to avoid repeated allocations
         static cv::Mat left_image_cv_bgra;
         static cv::Mat left_image_cv_rgb;
         static sensor_msgs::msg::Image left_image_msg;
-        static sensor_msgs::msg::Image depth_image_msg;
         static lart_msgs::msg::ConeArray cone_array;
         static visualization_msgs::msg::MarkerArray marker_array;
         static foxglove_msgs::msg::ImageAnnotations annotations_msg;
@@ -192,11 +180,7 @@ void ZedCenter::publishImages()
         // Detection ALWAYS runs, regardless of whether we published the image
         auto detections = detector_.detect(gpu_left_rgb_);
 
-        // Cache camera intrinsics for back-projection
-        const double fx = cached_calibration_params.left_cam.fx;
-        const double fy = cached_calibration_params.left_cam.fy;
-        const double cx = cached_calibration_params.left_cam.cx;
-        const double cy = cached_calibration_params.left_cam.cy;
+
 
         // Reserve space for detections
         cone_array.cones.reserve(detections.size());
@@ -221,32 +205,22 @@ void ZedCenter::publishImages()
             const auto &det = detections[i];
             const cv::Rect &box = det.box;
 
-            // STEP 1: Find the center pixel of the bounding box
-            double cx_px = box.x + box.width  / 2.0;
-            double cy_px = box.y + box.height / 2.0;
+            // STEP 1: Bottom-center pixel (footpoint where cone touches the ground)
+            double u = box.x + box.width / 2.0;
+            double v = box.y + box.height;  // bottom edge, not center
 
-            // STEP 2: Sample depth at the center pixel (clamp to image bounds)
-            int u = std::clamp(static_cast<int>(cx_px), 0, depth_cv.cols - 1);
-            int v = std::clamp(static_cast<int>(cy_px), 0, depth_cv.rows - 1);
-            float Z = depth_cv.at<float>(v, u);  // depth map is CV_32FC1, value in meters
+            // STEP 2: Homography projection (pixel → ground plane in meters)
+            const double* H = homography_matrix_.data();
+            double W = H[6] * u + H[7] * v + H[8];
+            if (std::abs(W) < 1e-3) continue;  // reject near-horizon points
 
-            // Skip invalid depth readings
-            if (std::isnan(Z) || std::isinf(Z) || Z <= 0.0f)
-            {
-                continue;
-            }
+            double X_ground = (H[0] * u + H[1] * v + H[2]) / W;  // forward (meters)
+            double Y_ground = (H[3] * u + H[4] * v + H[5]) / W;  // right (meters)
 
-            // STEP 3: Back-project to 3D camera frame (X=right, Y=down, Z=forward)
-            double X_cam = (cx_px - cx) * Z / fx;
-            double Y_cam = (cy_px - cy) * Z / fy;
-            double Z_cam = Z;
-
-            // STEP 4: Convert camera frame → ZED coordinate system (RIGHT_HANDED_Z_UP_X_FWD)
-            //    Camera: X=right, Y=down, Z=forward
-            //    ZED:    X=forward, Y=left, Z=up
-            double obj_x =  Z_cam;   // forward
-            double obj_y = -X_cam;   // left
-            double obj_z = -Y_cam;   // up
+            // STEP 3: Map to ZED coordinate convention (X=forward, Y=left, Z=up)
+            double obj_x =  X_ground;   // forward
+            double obj_y = -Y_ground;   // left (invert right)
+            double obj_z =  0.0;        // cone is on the ground plane
 
             // Distance filter (squared to avoid sqrt, same as zed_bridge.cpp)
             double distance_sq = obj_x * obj_x + obj_y * obj_y;
@@ -348,25 +322,6 @@ void ZedCenter::publishImages()
         this->cone_array_pub->publish(std::move(cone_array));
         this->marker_array_pub->publish(std::move(marker_array));
         this->annotations_pub_->publish(annotations_msg);
-        // Publish depth image (same pattern as zed_bridge.cpp lines 404-432)
-        depth_image_msg.header.stamp = timestamp;
-        depth_image_msg.header.frame_id = LEFT_IMG_FRAME_ID;
-        depth_image_msg.height = depth_map.getHeight();
-        depth_image_msg.width = depth_map.getWidth();
-        depth_image_msg.encoding = "32FC1";
-        depth_image_msg.step = depth_map.getStepBytes();
-        const size_t data_size = depth_map.getHeight() * depth_map.getWidth() * sizeof(float);
-        const uint8_t *data_ptr = reinterpret_cast<const uint8_t *>(depth_map.getPtr<sl::float1>());
-        depth_image_msg.data.assign(data_ptr, data_ptr + data_size);
-
-        depth_camera_info_template.header.stamp = timestamp;
-        depth_camera_info_template.height = depth_image_msg.height;
-        depth_camera_info_template.width = depth_image_msg.width;
-        depth_camera_info_template.header.frame_id = LEFT_IMG_FRAME_ID;
-
-        // Publish using image_transport (same as zed_bridge.cpp line 432)
-        this->depth_image_pub.publish(std::make_shared<sensor_msgs::msg::Image>(std::move(depth_image_msg)));
-        this->depth_info_pub->publish(depth_camera_info_template);
 
         this->frame_counter++;
         this->first_image = true;
